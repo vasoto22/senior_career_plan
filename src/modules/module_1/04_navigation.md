@@ -83,6 +83,7 @@ GoRouter(
     GoRoute(path: '/monitoreo', builder: (context, state) => MonitoringPage()),
   ],
 );
+```
 ---
 
 ## 2. auto_route (Basado en Generación de Código)
