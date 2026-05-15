@@ -335,3 +335,97 @@ Este es el más importante si alguien pregunta *"¿para qué, si ya tenemos unit
 > *"Teníamos un bug potencial que los unit tests no podían detectar: si `VehicleSettingsRepositoryImpl` cambia cómo interpreta la respuesta del API — por ejemplo, si `'Vehicle ID Duplicated'` pasa a ser `'DUPLICATE'` — el unit test del servicio seguiría pasando porque usa un mock. El test de integración fallaría de inmediato porque ejecuta el código real del repositorio."*
 
 Ese es el argumento que convence: **los unit tests prueban el contrato que tú mismo declaraste. Los tests de integración prueban que el contrato real se cumple.**
+
+
+
+---
+
+
+Las pruebas de integración que añadimos no son E2E sobre emulador; son integración in-process: instanciamos capas reales conectadas (servicio, repositorio, cubit según el caso) y solo mockeamos los límites externos (API y conexión a base de datos), que es donde el proyecto no controla el comportamiento. Así verificamos el contrato entre capas y el flujo real de datos, con la misma herramienta que el resto de tests (flutter test), sin emulador y en tiempos de milisegundos, lo que las hace viables en CI.
+
+Implementamos dos bloques en test/features/vehicle/integration/. El primero ejercita la cadena VehicleServiceImpl → VehicleSettingsRepositoryImpl → VehicleRepositoryImpl con API y DB mockeadas: comprueba, entre otros, que ante una respuesta de nickname duplicado el repositorio interpreta bien el mensaje de la API y no persiste un update local indebido, y que ante éxito sí se actualiza la DB cuando corresponde. El segundo conecta VehicleUpdateCubit → VehicleServiceImpl → repositorio real y valida la secuencia de estados que vería la UI (por ejemplo loading seguido de success o vuelta a initial en error/duplicado), de modo que un fallo en la lógica del servicio o del repositorio se refleja en el cubit, no solo en un mock del servicio.
+
+En conjunto, estas pruebas reducen el riesgo de regresiones en el flujo de actualización de nickname: detectan errores de mapeo y de política de persistencia que los unit tests con mocks sustitutos no cubren, y documentan el comportamiento esperado del flujo completo dentro de la feature. Su ejecución es flutter test test/features/vehicle/integration/ (o el archivo concreto), alineado con la guía del repositorio.    
+
+
+---
+
+Te dejo una guía tipo “charla técnica”: anatomía, paso a paso y cuidados. Puedes mezclarla con el texto de sustento que ya tienes.
+
+---
+
+## Anatomía de estas pruebas
+
+**Idea central:** un “tubo” de código **real** entre dos tapas **mock**. Lo que entra y sale por las tapas (HTTP, DB, preferencias) lo controlás vos; lo del medio es el mismo código que corre en la app.
+
+```
+  [MockApi] ──► VehicleRepositoryImpl (real)
+                    │
+  [MockDb]  ──► VehicleSettingsRepositoryImpl (real)
+                    │
+                VehicleServiceImpl (real)
+                    │
+              (en el 2º archivo) VehicleUpdateCubit (real)
+```
+
+- **Mocks:** límites que no querés levantar de verdad (red, persistencia).
+- **Reales:** las implementaciones que querés que **colaboren**; si una capa intermedia fuera mock, dejaría de ser integración de esa cadena.
+
+**Partes típicas del archivo de test**
+
+1. **`main()` + imports** — `flutter_test`, `mockito`, tipos de `domain` / `infrastructure` y datos compartidos del feature (`../data.dart`, mocks generados).
+2. **`late` para dependencias** — se reasignan en `setUp` para cada test limpio.
+3. **`setUp`** — crea mocks, instancia repositorios y servicio **en el orden correcto de dependencias** (p. ej. `VehicleRepositoryImpl` antes de `VehicleSettingsRepositoryImpl` si este último lo necesita).
+4. **`group`** — agrupa por flujo (`updateVehicleNickname`, etc.).
+5. **Cada test:** Arrange (`when` en mocks) → Act (una llamada como haría la UI) → Assert (`expect` + a veces `verify` / `verifyNever`).
+6. **Test del Cubit:** además `TestWidgetsFlutterBinding.ensureInitialized()`, un **builder** que devuelve el cubit cableado, y **`blocTest`** con `expect` como lista de **estados en orden** (y `verify` opcional sobre la API/DB).
+
+---
+
+## Paso a paso para construir una prueba así
+
+1. **Definir la pregunta del test**  
+   Ejemplo: “¿Si la API devuelve X, la cadena servicio → repositorio devuelve el enum correcto y no escribe en DB?”
+
+2. **Dibujar la cadena**  
+   Listá qué clases son **reales** y cuáles **mock**. Regla práctica: mock solo lo que es **externo** o muy pesado (red, disco, reloj si aplica).
+
+3. **Crear el `setUp`**  
+   - Instanciar mocks.  
+   - Construir repositorios/servicios reales inyectando esos mocks.  
+   - Si el servicio pide más dependencias (otros servicios), o las mockeás mínimas o usá los mocks ya existentes en el proyecto (`MockUserInfoService`, etc.).
+
+4. **Arrange**  
+   - `when(mockApi.put(...)).thenAnswer(...)` con el `ResponseDto` que corresponda (éxito, duplicado, error).  
+   - Si el flujo lee DB antes de actualizar, `when(mockDb.getOneWhere...)` con el modelo o `null`.  
+   - Alineá **URLs y formData** con lo que usa el código real (en vuestro caso la URL construida con `ApiConstants.vehicleApi`).
+
+5. **Act**  
+   Una llamada al **API pública** del servicio o del cubit (`updateVehicleNickname`, `vehicleUpdate`, `onNicknameChanged` + `vehicleUpdate`), igual que la pantalla.
+
+6. **Assert**  
+   - `expect` sobre el **valor de retorno** o sobre el **tipo/orden de estados** del cubit.  
+   - **Efectos secundarios:** `verify` / `verifyNever` sobre `mockDb.update` cuando el negocio dice “no persistir en duplicado” o “sí persistir en éxito”.
+
+7. **Nombre del test**  
+   Que diga **comportamiento observable**, no nombre de método interno: “Devuelve duplicateNickname y no actualiza la DB local”.
+
+---
+
+## Cosas a tener en cuenta
+
+| Tema | Por qué importa |
+|------|------------------|
+| **No mockear el medio** | Si el repositorio es mock, volvés a un unit test disfrazado; no probás el mapeo ni las ramas reales. |
+| **`verify` y el contrato** | El `expect` del enum puede pasar con un bug si alguien “hace trampas” en otra capa; `verifyNever(mockDb.update)` ata el resultado a **efectos** que el negocio exige. |
+| **`blocTest` y el orden** | Si la UI primero llama `onNicknameChanged` y después `vehicleUpdate`, el test debe incluir **todos** los estados intermedios que emite el cubit en ese orden; si no, falla aunque “el final” sea correcto. |
+| **Matchers de Mockito** | `anyNamed('formData')` u otros matchers deben coincidir con la firma real del `put`; si no, el `when` no matchea y el test se vuelve confuso. |
+| **Aislamiento entre tests** | `setUp` que reconstruye el grafo evita que un test deje stubs viejos en el siguiente. |
+| **Alcance** | Un archivo de integración por **flujo de negocio** (p. ej. actualizar nickname) suele ser más claro que un mega-archivo. |
+| **No es E2E** | No validan Firebase, SSL, ni widgets en dispositivo real; eso sería otro nivel (`integration_test` + emulador). Comunicar eso en la sustentación evita expectativas equivocadas. |
+
+---
+
+## Frase corta para cerrar la “anatomía” en viva voz
+
+“Estas pruebas tienen **cuerpo real y extremos falsos**: el cuerpo es la misma composición de clases que en producción; los extremos falsos simulan red y base de datos para poder fijar escenarios sin levantar infraestructura.”

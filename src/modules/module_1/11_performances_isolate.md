@@ -1,0 +1,1 @@
+Se trabajó una HU para aplicar isolate a los enricher del app mobile y así no afectar el hilo principal, por lo que el tema del performance se da por trabajado y abordado, en esta parte se puede dar mas detalle
